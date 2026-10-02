@@ -60,10 +60,11 @@ resource "aws_security_group" "mtc_security_group" {
   vpc_id      = aws_vpc.mtc_vpc.id
 
   ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH from my IP only"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
   }
 
   egress {
