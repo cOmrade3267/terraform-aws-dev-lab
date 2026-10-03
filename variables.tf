@@ -11,3 +11,24 @@ variable "my_ip" {
     error_message = "my_ip must be a single IP in CIDR form ending in /32."
   }
 }
+variable "trusted_user" {
+  type    = string
+  default = "terraform-demo"
+
+  validation {
+    condition     = length(var.trusted_user) > 0 && !can(regex("\\*", var.trusted_user))
+    error_message = "trusted_user must be a specific IAM user name, not empty or a wildcard."
+  }
+}
+
+variable "role_name" {
+  type        = string
+  description = "Name of the lab role"
+  default     = "mtc_labreadonly"
+}
+
+variable "role_policy_arn" {
+  type        = string
+  description = "Managed policy attached to the lab role"
+  default     = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
