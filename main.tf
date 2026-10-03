@@ -68,6 +68,7 @@ resource "aws_security_group" "mtc_security_group" {
   }
 
   egress {
+    description = "Allow all outbound (apt and Docker downloads)"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -95,6 +96,12 @@ resource "aws_instance" "mtc_instance" {
   root_block_device {
     volume_size = 10
   }
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
   provisioner "local-exec" {
     command = templatefile("${path.module}/linux-ssh-config.tpl", {
       hostname     = self.public_ip
