@@ -60,3 +60,26 @@ resource "aws_iam_role_policy" "mtc_ec2_describe_vpcs" {
     }]
   })
 }
+
+resource "aws_iam_role_policy" "mtc_ec2_read_bucket" {
+  name = "read-lab-bucket-only"
+  role = aws_iam_role.mtc_ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ListThisBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.mtc_bucket.arn
+      },
+      {
+        Sid      = "ReadObjectsInThisBucket"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${aws_s3_bucket.mtc_bucket.arn}/*"
+      }
+    ]
+  })
+}
