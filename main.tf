@@ -89,7 +89,7 @@ resource "aws_instance" "mtc_instance" {
   vpc_security_group_ids = [aws_security_group.mtc_security_group.id]
   key_name               = aws_key_pair.mtc_auth.key_name
   user_data              = templatefile("${path.module}/userdata.tpl", {})
-
+  iam_instance_profile   = aws_iam_instance_profile.mtc_ec2_profile.name
   tags = {
     Name = "dev-instance"
   }
