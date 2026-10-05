@@ -28,6 +28,11 @@ Every code block in here is code I actually wrote and ran. Where I hit an error,
 16. [Command cheat sheet](#16-command-cheat-sheet)
 17. [Interview questions and answers](#17-interview-questions-and-answers)
 18. [What I have not covered yet](#18-what-i-have-not-covered-yet)
+19. [flaws.cloud: a full write-up, levels 1-6](#19-flawscloud-a-full-write-up-levels-1-6)
+20. [Auditing my own roles like I audited Level6](#20-auditing-my-own-roles-the-way-i-audited-level6)
+21. [A real private subnet: proving isolation](#21-a-real-private-subnet-proving-isolation-not-just-configuring-it)
+22. [NACLs: stateless vs stateful, built by hand](#22-nacls-stateless-vs-stateful-built-by-hand-including-the-classic-trap)
+23. [Full mistake log: levels 4-6 and the NACL exercise](#23-full-mistake-log-sessions-covering-levels-4-6-and-the-nacl-exercise)
 
 ---
 
@@ -1663,7 +1668,337 @@ Honest list of gaps:
 - **Testing and policy as code** (`terraform test`, OPA or Sentinel).
 - **Using short-lived credentials for Terraform itself** instead of an access key.
 - **Detection beyond Event history:** GuardDuty, EventBridge alerts, Athena over CloudTrail.
-- **Hands-on attack practice:** flaws.cloud, flaws2.cloud and CloudGoat (planned, not started).
-- **VPC extras:** a private subnet, flow logs, security groups versus NACLs in practice.
+- **Hands-on attack practice beyond flaws.cloud:** flaws2.cloud and CloudGoat (flaws.cloud itself is done — see section 19).
+- **VPC flow logs** (private subnet and NACL vs security group are now done hands-on — see sections 21-22).
+- **GuardDuty, EventBridge alerting, Athena over CloudTrail** — still only read about, not built.
 
-Next steps: turn the network into a module and move state to S3, then work through flaws.cloud and write the attack, prevent and detect lines for each level.
+Next steps: flaws2.cloud's defender path (closes the GuardDuty/Athena gap directly), then turn the network into a module and move state to S3.
+
+---
+
+## 19. flaws.cloud: a full write-up, levels 1-6
+
+I completed the entire flaws.cloud series end to end. Each level below has what the vulnerability was, what I actually ran, and the attack/prevent/detect lines. Levels 1-3 are summarized from earlier sessions; levels 4-6 are written in full since they were done more recently and involved real multi-step chains.
+
+**Rules of engagement followed throughout:** only flaws.cloud's own infrastructure, never anything else. Every found credential went into its own dedicated AWS CLI profile (`flaws_level3`, `flaws_level6`, etc.), never into `terraform_demo`. Credentials were tested with `aws sts get-caller-identity` before any other action, to confirm whose account they belonged to before using them further.
+
+### Level 1 — public bucket listing
+
+```bash
+dig +short flaws.cloud
+aws s3 ls s3://flaws.cloud/ --no-sign-request
+curl -s http://flaws.cloud/secret-dd02c7c.html
+```
+
+The bucket allowed anonymous listing (`--no-sign-request`, no credentials at all), revealing a file (`secret-dd02c7c.html`) that was never linked from the site. "Not linked anywhere" is not a security control if the bucket can simply be listed.
+
+1. **Attack:** anonymous `s3 ls` on a misconfigured bucket revealed every file, including an unlinked secret page.
+2. **Prevent:** Block Public Access on, never grant List to everyone, don't rely on obscure filenames as security.
+3. **Detect:** CloudTrail `PutBucketAcl`/`PutBucketPolicy`, Access Analyzer for public buckets, S3 access logs for who actually listed/read.
+
+### Level 2 — "Any Authenticated AWS User" is not "my team"
+
+```bash
+aws s3 ls s3://level2-....flaws.cloud --no-sign-request      # denied
+aws s3 ls s3://level2-....flaws.cloud --profile terraform_demo  # succeeded
+```
+
+The bucket's ACL granted access to the **"Any Authenticated AWS User"** group — which sounds like "my own account's users" but actually means **anyone with any AWS account on Earth**. My own, unrelated `terraform_demo` identity was enough to pass this check.
+
+1. **Attack:** a bucket trusted the AWS-wide "Any Authenticated AWS User" group instead of specific principals; any AWS account (including an attacker's free one) satisfies that check.
+2. **Prevent:** scope grants to exact IAM principal ARNs, the same way my own `mtc_labreadonly` trust policy names one exact user instead of a group.
+3. **Detect:** Access Analyzer specifically flags resources shared with this grantee group as cross-account exposure; `PutBucketAcl` in CloudTrail.
+
+### Level 3 — secrets live forever in git history
+
+```bash
+git-dumper http://level3-....flaws.cloud/.git ./dump
+cd dump && git log -p --all | grep -iE 'AKIA[0-9A-Z]{16}|secret' -B2 -A2
+```
+
+An exposed `.git/` directory let me reconstruct the full repository (no AWS credentials needed — plain HTTP). The history showed a commit named *"Oops, accidentally added something I shouldn't have"* that **deleted** `access_keys.txt` — but the prior commit, still fully present in history, contained the plaintext access key and secret. Deleting a file does not remove it from git history.
+
+1. **Attack:** a `.git` folder was publicly exposed alongside the static site. A credential was committed, later deleted in a new commit, but fully recoverable from history via anonymous HTTP requests, no git server access needed.
+2. **Prevent:** never commit secrets even briefly; `.gitignore` only prevents future commits, not past ones. If a secret is ever committed, rotate it — deleting the file or rewriting history isn't sufficient once it's been pushed anywhere fetchable. Never deploy a `.git` directory alongside a static site.
+3. **Detect:** gitleaks/trufflehog scanning (same tooling I ran against my own repo); CloudTrail/GuardDuty would show a leaked key being used from an unexpected source if it were abused.
+
+### Level 4 — a public EBS snapshot leaks a plaintext password
+
+**The chain:**
+
+```bash
+aws ec2 describe-snapshots --owner-ids <account> --profile flaws --region us-west-2
+aws ec2 describe-snapshot-attribute --snapshot-id snap-xxxx --attribute createVolumePermission --profile flaws --region us-west-2
+# -> Group: all  (publicly restorable)
+
+# DescribeSnapshot != CreateVolume — needed MY OWN account for this step:
+aws ec2 create-volume --availability-zone us-west-2a --snapshot-id snap-xxxx --profile terraform_demo
+```
+
+A key distinction surfaced here: the leaked credential (`backup` user) could **discover** the snapshot (`DescribeSnapshot`) but that says nothing about whether it can **act** on it — `CreateVolume` is a separate permission, and in this case I used my own account to do the actual restore, since the snapshot's public-restore flag made that legitimate for anyone.
+
+After creating the volume, I attached it to a temporary instance **in the same availability zone** (an EBS volume cannot attach across AZs), mounted it read-only (`-o ro,noload`, so the original filesystem is never modified — `noload` specifically skips replaying the journal, which matters when examining evidence without altering it), and searched by **historical date range** rather than relative time, since the data was from 2017:
+
+```bash
+sudo mount -o ro,noload /dev/nvme1n1p1 /mnt/flaws
+sudo find /mnt/flaws -type f -newermt '2017-02-26' ! -newermt '2017-03-01'
+cat /mnt/flaws/home/ubuntu/setupNginx.sh
+```
+
+The setup script contained the **plaintext** password used to create an nginx Basic Auth account — stronger evidence than `/etc/nginx/.htpasswd`, which only held the hash.
+
+1. **Attack:** a public EBS snapshot let me restore a filesystem from my own account, mount it read-only, and recover a setup script containing a plaintext password — bypassing web authentication without touching the live server at all.
+2. **Prevent:** never leave snapshot `createVolumePermission` set to `all`; scope it to specific account IDs. Never put real credentials in setup scripts or leave them in shell history — use Secrets Manager or SSM Parameter Store.
+3. **Detect:** CloudTrail `ModifySnapshotAttribute` (when made public) and `CreateVolume` from unfamiliar account IDs; AWS Config has a managed rule for public EBS snapshots.
+
+**Mistake → concept, this level:** none during the actual recovery — the one real snag was reasoning about **AZ placement**: an EBS volume and the instance mounting it must be in the same availability zone. That's a concept worth internalizing on its own, not just a one-off fact, since it explains a whole category of "volume attach failed" errors in real work too.
+
+### Level 5 — SSRF to the metadata service to IAM credentials
+
+This was the single most important chain in the whole series, and it directly mirrors section 11 of this document, from the other side.
+
+```bash
+# the open proxy itself:
+curl -i "http://4d0cf0....flaws.cloud/proxy/neverssl.com/"          # proves SSRF works at all
+curl -s "http://4d0cf0....flaws.cloud/proxy/169.254.169.254/latest/meta-data/"
+curl -s ".../proxy/169.254.169.254/latest/meta-data/iam/security-credentials/"      # -> "flaws"
+curl -s ".../proxy/169.254.169.254/latest/meta-data/iam/security-credentials/flaws" # -> full temp creds
+```
+
+The site exposed a generic URL-fetching proxy (`/proxy/<host>/<path>` → server-side `GET`). Pointed at the instance's own metadata IP, it returned the IAM role name, and then the role's **live temporary credentials** — `AccessKeyId`, `SecretAccessKey`, and critically, a `SessionToken`, since these are STS-issued temporary credentials, not a permanent key pair. Using them required exporting all three:
+
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+aws sts get-caller-identity
+# -> arn:aws:sts::<account>:assumed-role/flaws/i-05bef8a081f307783
+```
+
+The ARN shape (`assumed-role/flaws/i-...`) is the same pattern as my own `mtc_ec2_role` output — an **assumed role**, not an IAM user, with the EC2 instance ID as the session name.
+
+1. **Attack:** an open HTTP proxy allowed SSRF. Pointing it at the instance's own metadata service retrieved the IAM role's full temporary credentials, which I then used directly as my own AWS identity.
+2. **Prevent:** this is exactly why I require IMDSv2 on my own instance (`http_tokens = "required"`) — it forces a `PUT` with a custom header first, which a simple GET-based proxy like this one cannot do. Also: never build an open URL-fetching proxy without an allowlist of destination hosts.
+3. **Detect:** CloudTrail shows API calls from `assumed-role/flaws/i-...` originating from outside the expected network context; GuardDuty has a finding type specifically for IMDS-based credential exfiltration.
+
+**Mistake → concept, this level:** I never fetched the credential-content endpoint on my *own* lab instance during the original IMDSv2 test (section 11) — only the `401` refusal and the role-name response. Doing the full SSRF chain here, on a target where it was *allowed*, is what made the abstract "credentials could be stolen" concrete: I saw the actual `AccessKeyId`/`SecretAccessKey`/`SessionToken` JSON blob a real attacker would get. The concept ("IMDSv1 leaks credentials via SSRF") only became fully real once I'd extracted a real one, even on a throwaway training account.
+
+### Level 6 — "SecurityAudit" is not as read-only as it sounds
+
+This level is the longest chain, and the one with the most mistakes along the way — all documented below in its own section, since the mistakes themselves map directly onto IAM concepts worth remembering.
+
+**Final working chain:**
+
+```bash
+aws sts get-caller-identity --profile flaws_level6
+# -> user/Level6
+
+aws iam list-attached-user-policies --profile flaws_level6 --user-name Level6
+# -> MySecurityAudit (custom!) + list_apigateways (custom!)
+
+aws iam get-policy-version --profile flaws_level6 \
+  --policy-arn arn:aws:iam::<acct>:policy/MySecurityAudit --version-id v1
+# -> a trimmed copy of AWS's managed SecurityAudit; description literally says "Most of the security audit capabilities"
+
+aws --profile flaws_level6 --region us-west-2 lambda get-policy --function-name Level6
+# -> resource policy reveals: arn:aws:execute-api:us-west-2:<acct>:s33ppypa75/*/GET/level6
+
+aws --profile flaws_level6 --region us-west-2 apigateway get-stages --rest-api-id "s33ppypa75"
+# -> stage name: Prod
+
+curl -s https://s33ppypa75.execute-api.us-west-2.amazonaws.com/Prod/level6
+```
+
+**The actual lesson:** `lambda:GetFunction` (reads source code) and `cloudtrail:LookupEvents` (reads activity history) and `logs:GetLogEvents` (reads log content) were all genuinely absent from the custom "audit" policy — by design, since reading *content* is excluded from a read-only audit role even though reading *metadata* is allowed. But `lambda:GetPolicy` **was** present, because it only reveals a function's **resource policy** (who's allowed to invoke it) — metadata, not content. That one metadata-only permission, combined with a second narrow custom policy (`apigateway:GET` on `/restapis/*`, not the ability to *list* all APIs), was enough to reconstruct a hidden, unauthenticated invocation URL and call the function directly — no code read, no logs read, no event history read.
+
+1. **Attack:** a trimmed `SecurityAudit`-style policy allowed `lambda:GetPolicy` (resource-policy metadata, not code) and a narrow custom `apigateway:GET` permission. Chaining the two revealed a hidden API Gateway URL that invoked a Lambda function directly, with no further authentication.
+2. **Prevent:** audit/read-only roles need review of **all** attached policies together, not each in isolation — a single metadata-read permission looks harmless alone but can reveal integration details (ARNs, IDs, trust relationships) that narrow an attacker's search space dramatically. Re-evaluate the combined blast radius whenever a "just this one extra thing" custom policy gets attached to an otherwise-standard role.
+3. **Detect:** CloudTrail logging of `GetPolicy` and `apigateway:GET` calls from an identity that doesn't normally make them, especially in quick succession, is itself a signal worth alerting on; API Gateway access logging would show the final invocation's source.
+
+**Mistake → concept, this level (the full list, since this is where I made the most, and each one taught something specific):**
+
+| What I tried | What happened | The actual concept it taught |
+|---|---|---|
+| `lambda:GetFunction` on the function | `AccessDenied` | `SecurityAudit`-style policies deliberately separate **metadata** read access (`List*`, `Get*` on config) from **content** read access (source code, log events, activity history) — "read-only" does not mean "read-everything." |
+| `logs:GetLogEvents` on a 5MB log group | `AccessDenied` | Same pattern as above — I initially treated the large `storedBytes` figure as a strong lead; it wasn't (see next row), and chasing it cost a few steps before I correctly moved on. |
+| Reading per-stream `storedBytes` as a sized lead | Every individual stream showed `storedBytes: 0`, contradicting the group total | That field is known to be unreliable/stale on individual log streams in the API — a reminder to verify a "signal" with a second, independent source before building a plan around it, rather than trusting one metric at face value. |
+| `cloudtrail:LookupEvents` | `AccessDenied` | CloudTrail *activity history* (what happened) is content-like and excluded, same as the Lambda code — consistent with the pattern above, which by this point I should have (and eventually did) predict before trying. |
+| Typed `<name-from-above>`, `<the-version-id-from-above-no-brackets>`, `<real-id-here>`, `<paste the real stream name here, no angle brackets>` literally into commands — four separate times | `bash: syntax error near unexpected token 'newline'` each time | Angle brackets in a command are a **slot to fill with a real value**, never literal text to type — this is a pure syntax habit, not an AWS concept, but it cost real time repeatedly. Worth deliberately pausing on every `<...>` before hitting enter from now on. |
+| Assumed `apigateway:GET` on `/restapis/*` would allow listing all APIs | `AccessDenied` on `get-rest-apis` | IAM resource ARNs with a wildcard **suffix** (`/restapis/*`) scope to sub-paths under a known parent, not to the **collection/list** operation on the parent itself. `GET /restapis/{id}` (get one, if you know the ID) and `GET /restapis` (list all) are different API operations even though they share a URL prefix — a wildcard on the former does not imply the latter. |
+| Assumed `MySecurityAudit` was identical to AWS's managed `SecurityAudit` | It was a **custom** policy with the same name pattern, deliberately trimmed | Always read the actual attached policy ARN and document — don't assume a familiar-sounding name means the familiar AWS-managed version. The policy's own description ("**most** of the security audit capabilities") was a direct, written clue I should have caught immediately instead of discovering by trial and error across several denied calls. |
+
+---
+
+## 20. Auditing my own roles the way I audited `Level6`
+
+After finishing level 6 — where no single permission was dangerous alone, but two narrow ones combined to leak a hidden resource — I went back and applied the same question to my own `mtc_ec2_role` and `mtc_labreadonly`: **not** "does any one permission look dangerous," but "what's the most someone could learn or do by combining everything this identity currently has, plus anything reachable through it?"
+
+```bash
+aws iam list-role-policies --profile terraform_demo --role-name mtc_ec2_role
+aws iam list-attached-role-policies --profile terraform_demo --role-name mtc_ec2_role
+```
+
+**Mistake → concept here:** my first attempt at this returned `NoSuchEntity` for the role. The cause wasn't a permissions problem — I had run `terraform destroy` at the end of the S3 session, which removed the role along with everything else, since it's an ordinary Terraform-managed resource with no special protection against destroy. **Concept:** `terraform destroy` is total — it doesn't "clean up the risky parts," it removes everything in state, including identities I might later want to audit. Re-applying just the IAM pieces with `-target` brought the role back for inspection without rebuilding the whole lab (and without billing for an EC2 instance).
+
+**The actual audit result, once the role existed:** two inline policies only (`describe-vpcs-only`, `read-lab-bucket-only`), zero attached managed policies — exactly matching `iam.tf`, no drift. Chained together, the worst a leaked credential for this role could do is list two VPC IDs and read one private bucket's contents. No write access anywhere, no IAM visibility, no other buckets. That's a genuinely small, verified blast radius — a useful positive contrast to level 6's chain, where two individually-narrow permissions still composed into something unintended.
+
+By contrast, `mtc_labreadonly` carries AWS's managed `ReadOnlyAccess` — broad, account-wide `List*`/`Describe*`/`Get*` across nearly every service. Chained, that's a full reconnaissance map of the account handed to one identity: every bucket name, every IAM role's trust policy, every security group's rules — nothing writable, but a significant information-disclosure surface on its own, which is worth stating plainly rather than assuming "read-only" means "low risk" by default.
+
+---
+
+## 21. A real private subnet: proving isolation, not just configuring it
+
+My original lab only ever had a **public** subnet (route to an internet gateway). This exercise added a genuinely private one and, critically, didn't stop at writing the config — I used the AWS API to independently verify both directions of isolation, the same evidentiary standard as the audits above.
+
+### The Terraform
+
+```hcl
+resource "aws_subnet" "mtc_private_subnet" {
+  vpc_id            = aws_vpc.mtc_vpc.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-west-2a"
+
+  tags = {
+    Name = "dev-private-subnet"
+  }
+}
+
+resource "aws_route_table" "mtc_private_route_table" {
+  vpc_id = aws_vpc.mtc_vpc.id
+
+  tags = {
+    Name = "dev-private-route-table"
+  }
+}
+
+resource "aws_route_table_association" "mtc_private_route_table_association" {
+  subnet_id      = aws_subnet.mtc_private_subnet.id
+  route_table_id = aws_route_table.mtc_private_route_table.id
+}
+```
+
+What makes it private is what's **absent**: no `map_public_ip_on_launch`, and critically, **no `aws_route` resource at all** pointing this route table at the internet gateway. An empty route table only carries the automatic local-VPC route AWS adds to every table.
+
+### Verifying it independently, not just trusting the config
+
+```bash
+aws ec2 describe-route-tables --profile terraform_demo --region us-west-2 \
+  --filters "Name=tag:Name,Values=dev-private-route-table" --query 'RouteTables[].Routes'
+```
+
+Returned exactly one route: `10.0.0.0/16 → local`. No IGW, no `0.0.0.0/0`.
+
+Then launched a real instance into the subnet and checked its actual assigned attributes, not the plan:
+
+```bash
+terraform state show aws_instance.mtc_private_test | grep -E 'public_ip|private_ip'
+# associate_public_ip_address = false
+# private_ip = "10.0.2.145"
+# public_ip  = null
+```
+
+**The concept this proves, stated precisely:** a missing public IP is a *structurally stronger* guarantee than a security-group deny rule. A security group can be misconfigured open by a single mistaken rule; an instance with no public IP has no address for inbound internet traffic to even target, regardless of what any firewall rule says. Combined with a route table that has no path to `0.0.0.0/0`, outbound is equally impossible — not "blocked," but "no path exists."
+
+**Mistake → concept here:** I pinged the **wrong IP** first (`10.0.1.147`, in the *public* subnet's range, not `10.0.2.x`), and got `Destination Host Unreachable` — an ARP-level "nothing answered," not a firewall block. That result told me nothing about the NACL or isolation; it just meant no live host existed at that address. **Concept:** before drawing any conclusion from a network test, confirm the target address is actually correct and actually belongs to the resource under test — an unexpected result is only evidence once the experiment itself is verified to be testing the right thing.
+
+---
+
+## 22. NACLs: building the stateless-vs-stateful lesson by hand, including the classic trap
+
+### The concept, stated precisely before any code
+
+A **security group** is stateful and applies to an instance: allow inbound, and the reply is automatically permitted, regardless of protocol. A **NACL** is stateless and applies to a whole subnet: every packet, in both directions, is checked independently against numbered rules (first match wins), with **no memory of connections** — an allowed inbound packet does not imply its reply is allowed outbound. Both layers are enforced on every packet; neither is a substitute for the other.
+
+### Stage 1 — prove an empty NACL blocks everything, including VPC-internal traffic
+
+```hcl
+resource "aws_network_acl" "mtc_private_nacl" {
+  vpc_id     = aws_vpc.mtc_vpc.id
+  subnet_ids = [aws_subnet.mtc_private_subnet.id]
+  tags = { Name = "dev-private-nacl" }
+}
+```
+
+No `ingress`/`egress` blocks at all → AWS appends an implicit final deny-all. From the **public** instance (same VPC, same security group, which would normally allow this traffic):
+
+```bash
+ping -c 3 10.0.2.145
+# 100% packet loss, no "Destination Host Unreachable" — silent drop
+```
+
+The **absence** of an unreachable message (versus the wrong-IP test in section 21, which *did* show that message) is itself the signal: silent loss means something is actively filtering the packets, not that nothing exists at the address.
+
+**Mistake → concept:** the test instance's subnet ID had changed between an earlier apply and this one (`subnet-0e3253741d7128619` → `subnet-0655e904a9fb5317c`), because an earlier `-target` apply had forced a replace somewhere upstream. Before trusting the ping result, I cross-checked that the NACL's `subnet_ids` and the subnet resource's actual current `id` matched (`terraform state show` on both). **Concept:** in Terraform, a resource's ID is not guaranteed stable across its lifetime — a replace changes it. Any test that depends on "this specific ID" needs to re-confirm the ID at test time, not rely on an ID seen in an earlier plan or screenshot.
+
+### Stage 2 — add ICMP both ways, and hit the "fixed one layer, forgot the other" trap
+
+```hcl
+ingress {
+  rule_no = 100; protocol = "icmp"; icmp_type = -1; icmp_code = -1
+  action = "allow"; cidr_block = "10.0.0.0/16"; from_port = 0; to_port = 0
+}
+egress {
+  rule_no = 100; protocol = "icmp"; icmp_type = -1; icmp_code = -1
+  action = "allow"; cidr_block = "10.0.0.0/16"; from_port = 0; to_port = 0
+}
+```
+
+**Mistake → concept:** my first attempt used `rule_action = "allow"` instead of `action = "allow"`, giving `Unsupported argument`. The two names exist because Terraform's AWS provider offers **two different ways** to define the same NACL rule: inline `ingress`/`egress` blocks inside `aws_network_acl` (argument: `action`), or a standalone `aws_network_acl_rule` resource (argument: `rule_action`). **Concept:** always check which resource/block schema a given argument belongs to — similar-sounding arguments across related-but-distinct resource types are a common source of exactly this error, and the fix is checking the provider docs for the specific resource, not guessing by pattern-matching to a similar one.
+
+After fixing that and applying, the ping **still** failed — 100% loss again. This was a second, independent lesson:
+
+```bash
+terraform state show aws_security_group.mtc_security_group | grep -A5 ingress
+# only TCP/22 from my personal IP — nothing for ICMP, nothing from inside the VPC
+```
+
+**Mistake → concept:** I had fixed the NACL (now explicitly allowing ICMP both directions) but the ping still failed, because the **security group** independently had no rule allowing ICMP at all. **Concept, the central one of this whole exercise:** SG and NACL are not alternatives or a single combined check — they are two fully independent gates, and **both must say yes** for traffic to pass. Fixing one layer while the other still denies produces the exact same symptom (silent failure) as fixing neither, which makes this specific kind of bug easy to misdiagnose as "my NACL rule is wrong" when the NACL was actually already correct.
+
+Added a matching SG ingress rule for ICMP from `10.0.0.0/16`; ping then succeeded cleanly (`0% packet loss`).
+
+### Stage 3 — the ephemeral-port trap, done deliberately
+
+Allowed TCP/22 at the NACL, **both directions**, plus a matching SG rule — then tried SSH from the public instance to the private one:
+
+```bash
+ssh ubuntu@10.0.2.145
+# Connection timed out
+```
+
+**Reasoning through why, before accepting a guess:** the inbound SYN (destination port 22) matches the NACL's ingress rule correctly. But the **reply** SYN-ACK has source port 22 and **destination port = the client's ephemeral port** (something in the high 1024-65535 range, chosen by the client OS). NACL `from_port`/`to_port` filters always describe the **destination port being matched**, for both ingress and egress rules alike. My egress rule only covered destination port 22 — so the reply, destined for an ephemeral port, matched nothing and fell through to the implicit deny.
+
+**Concept, stated as the rule to remember:** an NACL egress rule "for port 22" only covers outbound packets *going to* port 22 — it does **not** cover reply packets *coming from* port 22 but addressed elsewhere. This is the single most common real-world NACL misconfiguration, and the fix is a dedicated rule for the ephemeral range:
+
+```hcl
+egress {
+  rule_no = 120; protocol = "tcp"; action = "allow"
+  cidr_block = "10.0.0.0/16"; from_port = 1024; to_port = 65535
+}
+```
+
+After adding this, the SSH attempt progressed from a silent timeout to an actual TLS/SSH negotiation and a `Permission denied (publickey)` — a completely different failure class, proving the full handshake and reply path now worked; the remaining denial was just local key availability on the jump host, unrelated to networking. Copying the key over and retrying produced a full working shell on the private instance, reached entirely through the public one — a real bastion-host pattern, proven, not just described.
+
+### Three lines for the NACL exercise as a whole
+
+1. **Attack/scenario:** demonstrated, from an empty deny-all baseline, exactly how a stateless NACL differs from a stateful security group — including the specific, common mistake of allowing a service port both ways at the NACL while forgetting the ephemeral reply-port range, which silently breaks TCP services even though the "main" port is correctly allowed in both directions.
+2. **Prevent:** when writing NACL rules for any TCP service, always pair the service-port ingress/egress rules with an outbound (or inbound, depending on direction of initiation) rule for the ephemeral range 1024-65535 — this is non-optional for any two-way TCP flow through a NACL.
+3. **Detect/verify:** never trust "I wrote the rule" as proof it works — reproduce the actual failure first (predict it from the mechanism, confirm it happens), then reproduce the fix, so the explanation is grounded in an observed before/after rather than assumed from documentation.
+
+---
+
+## 23. Full mistake log, sessions covering levels 4-6 and the NACL exercise
+
+Added to the error log in section 15, kept separate here since each of these maps to a specific concept rather than a one-off typo, as explained inline above. Summarized as a table for quick reference:
+
+| Mistake | Concept it taught |
+|---|---|
+| Typed `<placeholder>` text literally into commands, repeatedly, across multiple sessions | Angle brackets mark a slot to fill, never literal text — worth a deliberate pause before every command containing one |
+| Assumed `lambda:GetFunction`/`logs:GetLogEvents`/`cloudtrail:LookupEvents` would be covered by a "SecurityAudit"-named policy | Read-only/audit policies separate **metadata** access from **content** access by design; don't assume scope from a familiar name — read the actual attached policy |
+| Chased a large `storedBytes` figure as a lead | Verify a signal against a second source before building a plan on it; one metric alone can be stale or misleading |
+| Assumed a wildcard resource ARN (`/restapis/*`) implied list/collection access too | A wildcard on a sub-path scopes to operations on *known* items under that path, not to the separate list-all operation on the parent |
+| Assumed a custom policy named like a well-known AWS-managed one (`MySecurityAudit`) had the same permissions | Always read the actual policy document and ARN; similar names are not the same policy |
+| Used `rule_action` instead of `action` in an inline NACL block | Two different Terraform resource/block schemas exist for the same NACL concept (`aws_network_acl` inline blocks vs `aws_network_acl_rule`) with different argument names — check the schema for the specific resource in use |
+| Fixed the NACL, still saw failure, initially unclear why | SG and NACL are independent gates that both must pass — fixing one while the other still denies produces an identical symptom to fixing neither |
+| Allowed TCP/22 at the NACL both ways, connection still timed out | NACL port filters match **destination** port for both directions; a reply's destination is the client's ephemeral port, not the service port — needs its own explicit egress rule for the ephemeral range |
+| Pinged the wrong IP (public subnet's range) before testing the private subnet | Confirm the test target is actually correct before drawing conclusions from an unexpected result |
+| Trusted a subnet ID from an earlier plan/screenshot without re-checking | Terraform resource IDs are not stable across a resource's lifetime if it gets replaced — re-verify the current ID before relying on it in a test |
