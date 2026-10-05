@@ -5,6 +5,14 @@ terraform {
       version = "~> 6.0"
     }
   }
+  backend "s3" {
+    bucket       = "mtc-tfstate-068648884098"
+    key          = "mtc-lab/terraform.tfstate"
+    region       = "us-west-2"
+    profile      = "terraform_demo"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

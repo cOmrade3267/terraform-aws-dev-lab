@@ -149,6 +149,9 @@ resource "aws_instance" "mtc_instance" {
   }
 }
 
+# Commented out: was a throwaway test instance for the NACL/SG exercise (section 22).
+# Uncomment and `terraform apply` if you want to rebuild it for further testing.
+/*
 resource "aws_instance" "mtc_private_test" {
   ami                    = data.aws_ami.mtc_ami.id
   instance_type          = "t2.micro"
@@ -160,6 +163,7 @@ resource "aws_instance" "mtc_private_test" {
     Name = "private-subnet-test"
   }
 }
+*/
 
 resource "aws_network_acl" "mtc_private_nacl" {
   vpc_id     = aws_vpc.mtc_vpc.id
