@@ -1,11 +1,11 @@
 module "dev_network" {
   source = "./modules/network"
 
-  name_prefix          = "dev"
-  vpc_cidr              = "10.0.0.0/16"
-  public_subnet_cidr    = "10.0.1.0/24"
-  private_subnet_cidr   = "10.0.2.0/24"
-  availability_zone     = "us-west-2a"
+  name_prefix         = "dev"
+  vpc_cidr            = "10.0.0.0/16"
+  public_subnet_cidr  = "10.0.1.0/24"
+  private_subnet_cidr = "10.0.2.0/24"
+  availability_zone   = "us-west-2a"
 }
 
 resource "aws_security_group" "mtc_security_group" {
