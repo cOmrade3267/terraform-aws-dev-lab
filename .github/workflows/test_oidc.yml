@@ -1,21 +1,25 @@
-name: Test OIDC AWS Connection
+name: Terraform Plan
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  test-auth:
+  plan:
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::068648884098:role/github-actions-terraform-lab
           aws-region: us-west-2
 
-      - name: Verify identity
-        run: aws sts get-caller-identity
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform init
+      - run: terraform plan
