@@ -5,7 +5,7 @@ resource "aws_iam_openid_connect_provider" "github" {
 }
 
 
- data "aws_iam_policy_document" "github_actions_trust" {
+data "aws_iam_policy_document" "github_actions_trust" {
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     effect  = "Allow"
@@ -27,6 +27,17 @@ resource "aws_iam_openid_connect_provider" "github" {
       values = [
         "repo:cOmrade3267@142096203/terraform-aws-dev-lab@1402225408:ref:refs/heads/main",
         "repo:cOmrade3267/terraform-aws-dev-lab:ref:refs/heads/main"
+      ]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:cOmrade3267@142096203/terraform-aws-dev-lab@1402225408:ref:refs/heads/main",
+        "repo:cOmrade3267/terraform-aws-dev-lab:ref:refs/heads/main",
+        "repo:cOmrade3267@142096203/terraform-aws-dev-lab@1402225408:pull_request",
+        "repo:cOmrade3267/terraform-aws-dev-lab:pull_request"
       ]
     }
   }
