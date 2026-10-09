@@ -1,21 +1,39 @@
-name: Test OIDC AWS Connection
+name: Terraform Plan with OIDC
 
 on:
   workflow_dispatch:
+  # Optionally add push or pull_request triggers if needed
+  # push:
+  #   branches: [ main ]
+  # pull_request:
+  #   branches: [ main ]
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  test-auth:
+  plan:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::068648884098:role/github-actions-terraform-lab
           aws-region: us-west-2
 
-      - name: Verify identity
-        run: aws sts get-caller-identity
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        # with:
+        #   terraform_version: 1.6.0 # Optional, to pin version
+
+      - name: Terraform Init
+        run: terraform init
+        # working-directory: ./your-directory # If your terraform code is in a subdirectory
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -var="my_ip=${{ secrets.MY_IP }}"
+        # working-directory: ./your-directory # If your terraform code is in a subdirectory
