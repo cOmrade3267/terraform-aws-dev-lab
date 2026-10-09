@@ -9,13 +9,11 @@ terraform {
     bucket       = "mtc-tfstate-068648884098"
     key          = "mtc-lab/terraform.tfstate"
     region       = "us-west-2"
-    profile      = "terraform_demo"
     encrypt      = true
     use_lockfile = true
   }
 }
 
 provider "aws" {
-  region  = "us-west-2"
-  profile = "terraform_demo"
+  region = "us-west-2"
 }
