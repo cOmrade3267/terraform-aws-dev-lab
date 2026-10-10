@@ -28,6 +28,7 @@ resource "aws_security_group" "mtc_security_group" {
     protocol    = "icmp"
     cidr_blocks = ["10.0.0.0/16"]
   }
+  
   ingress {
     description = "SSH from within the VPC (NACL ephemeral-port test)"
     from_port   = 22
@@ -35,6 +36,7 @@ resource "aws_security_group" "mtc_security_group" {
     protocol    = "tcp"
     cidr_blocks = ["10.0.0.0/16"]
   }
+  
   egress {
     description = "Allow all outbound (apt and Docker downloads)"
     from_port   = 0
@@ -45,9 +47,8 @@ resource "aws_security_group" "mtc_security_group" {
 }
 
 resource "aws_key_pair" "mtc_auth" {
-
   key_name   = "mtc_auth"
-  public_key = file(pathexpand("~/.ssh/mtckey.pub"))
+  public_key = var.ssh_public_key
 }
 
 resource "aws_instance" "mtc_instance" {
@@ -68,15 +69,6 @@ resource "aws_instance" "mtc_instance" {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
     http_put_response_hop_limit = 1
-  }
-
-  provisioner "local-exec" {
-    command = templatefile("${path.module}/linux-ssh-config.tpl", {
-      hostname     = self.public_ip
-      user         = "ubuntu"
-      identityfile = pathexpand("~/.ssh/mtckey")
-    })
-    interpreter = var.host_os == "windows" ? ["PowerShell", "-Command"] : ["/bin/bash", "-c"]
   }
 }
 

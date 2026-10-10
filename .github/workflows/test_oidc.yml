@@ -32,3 +32,6 @@ jobs:
       - name: Terraform Plan
         run: terraform plan -input=false -var="my_ip=${{ secrets.MY_IP }}"
         # working-directory: ./your-directory # If your terraform code is in a subdirectory
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -var="my_ip=${{ secrets.MY_IP }}" -var="ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}"

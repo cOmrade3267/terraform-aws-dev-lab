@@ -22,3 +22,8 @@ variable "availability_zone" {
   type        = string
   description = "Availability zone for both subnets"
 }
+
+variable "ssh_public_key" {
+  description = "The public SSH key for EC2 access"
+  type        = string
+}
